@@ -25,6 +25,15 @@
 next_oid(0).
 
 %%%=========================================================================
+%%% IDEMPOTENT ASSERT
+%%%=========================================================================
+
+%% assert_once(+Fact)
+%% Assert Fact only if it is not already in the database.
+assert_once(Fact) :- Fact, !.
+assert_once(Fact) :- assertz(Fact).
+
+%%%=========================================================================
 %%% OBJECT IDENTITY
 %%%=========================================================================
 
@@ -153,25 +162,25 @@ impl_slots(slots(Obj, Pairs))     :- findall(K-V, slot(Obj, K, V), Pairs).
 %% class is an instance of itself; object is an instance of class.
 %% class inherits from object.  method inherits from object.
 
-:- assertz(isa(object, class)).
-:- assertz(isa(class,  class)).
-:- assertz(isa(method, class)).
+:- assert_once(isa(object, class)).
+:- assert_once(isa(class,  class)).
+:- assert_once(isa(method, class)).
 
-:- assertz(inherits(class,  object)).
-:- assertz(inherits(method, object)).
+:- assert_once(inherits(class,  object)).
+:- assert_once(inherits(method, object)).
 
-:- assertz(slot(object, name, object)).
-:- assertz(slot(class,  name, class)).
-:- assertz(slot(method, name, method)).
+:- assert_once(slot(object, name, object)).
+:- assert_once(slot(class,  name, class)).
+:- assert_once(slot(method, name, method)).
 
 %% Bootstrap method objects.
 %% Each is an instance of 'method' with name + body slots.
 
 boot_method(Id, Selector, OnClass, Impl) :-
-    assertz(isa(Id, method)),
-    assertz(slot(Id, name, Selector)),
-    assertz(slot(Id, body, Impl)),
-    assertz(method_on(OnClass, Selector, Id)).
+    assert_once(isa(Id, method)),
+    assert_once(slot(Id, name, Selector)),
+    assert_once(slot(Id, body, Impl)),
+    assert_once(method_on(OnClass, Selector, Id)).
 
 :- boot_method(boot_new,        new,         class,  impl_new).
 :- boot_method(boot_alloc,      allocate,    class,  impl_allocate).
@@ -198,12 +207,25 @@ boot_method(Id, Selector, OnClass, Impl) :-
 %%   ?- send(new(point, #{x: 3, y: 4}, P)), send(x(P, X)).
 
 defclass(Name, Super, Slots) :-
+    retract_class(Name),
     assertz(isa(Name, class)),
     assertz(inherits(Name, Super)),
     assertz(slot(Name, name, Name)),
     assertz(slot(Name, superclass, Super)),
     assertz(slot(Name, slot_names, Slots)),
     maplist(create_accessor(Name), Slots).
+
+%% retract_class(+Name)
+%% Remove a previous class definition (if any) so defclass is idempotent.
+retract_class(Name) :-
+    % clean up accessor method objects hanging off this class
+    forall(method_on(Name, _, Mid),
+           ( retractall(isa(Mid, _)),
+             retractall(slot(Mid, _, _)) )),
+    retractall(method_on(Name, _, _)),
+    retractall(inherits(Name, _)),
+    retractall(isa(Name, class)),
+    retractall(slot(Name, _, _)).
 
 %% create_accessor(+Class, +SlotName)
 %% Generates a method object whose body reads/unifies via slot/3.
@@ -230,12 +252,17 @@ create_accessor(Class, SlotName) :-
 %% full message term:  my_pred(selector(Receiver, Arg1, ...)).
 
 defmethod(Class, Selector, BodyPred) :-
+    % clean up previous method object if overriding
+    ( retract(method_on(Class, Selector, Old))
+    -> retractall(isa(Old, _)),
+       retractall(slot(Old, _, _))
+    ;  true
+    ),
     fresh_oid(Mid),
     assertz(isa(Mid, method)),
     assertz(slot(Mid, name, Selector)),
     assertz(slot(Mid, class, Class)),
     assertz(slot(Mid, body, BodyPred)),
-    ( retract(method_on(Class, Selector, _)) -> true ; true ),
     assertz(method_on(Class, Selector, Mid)).
 
 %% defmethod(+Class, +Selector, +Args, +Goal)
