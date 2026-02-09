@@ -20,8 +20,20 @@ lookup(Class, Name, Impl) :-
     super(Class, Super),
     lookup(Super, Name, Impl).
 
-%% 'new' method on class
-has(class, new, new_object).
-class(new_object, behaviour).
-oapply(new_object, [Self, Instance]) :-
+%% new: allocate then initialize
+has(class, new, new_impl).
+class(new_impl, behaviour).
+oapply(new_impl, [Self, Instance]) :-
+    send(allocate(Self, Instance)),
+    send(initialize(Instance)).
+
+%% allocate: create a bare instance
+has(class, allocate, allocate_impl).
+class(allocate_impl, behaviour).
+oapply(allocate_impl, [Self, Instance]) :-
     assert(class(Instance, Self)).
+
+%% initialize: default no-op
+has(object, initialize, initialize_impl).
+class(initialize_impl, behaviour).
+oapply(initialize_impl, [_Self]).
