@@ -1,1 +1,18 @@
-* Project here
+* ObjVlisp via claude
+
+I want to see how promting the agnets affect claude.
+
+Each branch represents a different starting prompt.
+
+Interesting attempts:
+
+1. claude-attempt-3
+   + This one via a high level description did a decent job, the code
+     is kinda much with 85 lines of code but it mostly works
+   + Has a few bugs in the bootstrapping but the structure is correct
+   + Took over 10k tokens though
+2. claude-attempt-4
+   + This one started as a minimal exercise in explaining how the
+     system works algorithmically
+   + It's too minimal too oneshot, but it's refactors are nice and can
+     help the one shot
