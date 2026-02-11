@@ -1,0 +1,920 @@
+#+TITLE: ObjVLisp in Prolog: Comparing Hand-Written vs LLM-Generated Approaches
+#+AUTHOR: Analysis of mariari/Misc-Prolog-Scripts vs mariari/LLM-Experiments
+
+* Overview
+
+This document compares seven implementations of an ObjVLisp-style reflective
+object system in SWI-Prolog:
+
+*Human-written:*
+1. *mariari's* =objvlisp.pl= (this repo, 3 commits over Jan 18-19 2026)
+2. *Jam's (l4e21) first attempt* =objvlisp.pl= (l4e21/Misc-Prolog-Scripts, Jan 7 2026)
+3. *Jam's override version* =objvlisp2.pl= (jam/method-resolution-overrides branch, Jan 27 2026)
+
+*LLM-generated (Claude):*
+4. *Claude attempt 1* — minimal prompt, ~700 tokens
+5. *Claude attempt 2* — bidirectional query prompt, ~10k+ tokens
+6. *Claude attempt 3* — detailed 6-point spec, ~10k+ tokens
+7. *Claude attempt 4* — architecture-as-spec prompt, ~1.8k tokens
+
+All attempt to realize the same core idea from Cointe (1987): a metacircular
+object system where =Class= is an instance of itself and a subclass of =Object=.
+
+* Prompts Used
+
+| Attempt | Prompt (paraphrased)                                                       | Tokens | Verdict (from commits)                                      |
+|---------+----------------------------------------------------------------------------+--------+-------------------------------------------------------------|
+|       1 | "make a reflective object system in the vein of objvlisp, least code"      | ~700   | Compact but different idiom                                  |
+|       2 | "reflective object system like objvlisp, bidirectional querying, minimal   | ~10k+  | "much more correct and bidirectional" but "bootstrapping     |
+|         | relational primitives", with =send(new(point, #{x:3,y:4}, X))= example   |        | is wrong, can't override new"                               |
+|       3 | 6-point spec: bootstrapping methods, method objects, bidirectional query,  | ~10k+  | "Best attempt yet, model actually works, has a bug though,   |
+|         | inheritance resolution, relational storage (no mention of objvlisp!)       |        | in that new backtracks forever"                              |
+|       4 | Gave the exact data representation (=class/2=, =has/3=, =oapply/2=) and   | ~1.8k  | "Very minimal. Works." Then iterated: split new into         |
+|         | dispatch algorithm as a specification                                      |        | allocate + initialize                                        |
+
+* Object Representation
+
+This is the single biggest architectural divergence across all five.
+
+** Your implementation: SWI-Prolog Dicts
+
+#+begin_src prolog
+% Objects ARE dicts; the tag IS the class
+class(Object, Class) :- is_dict(Object, Class).
+
+% Initialization builds a dict via .put
+oapply(initial_point, [AllocSelf, _{x: X, y: Y}, InitSelf]) :-
+   InitSelf = AllocSelf.put(x, X).put(y, Y).
+#+end_src
+
+Strengths:
+- Native pattern matching, nested access, functional update via =.put=
+- No separate slot database — the dict /is/ the object
+- Reminds you of CL's =make-instance= (as you noted in comments)
+
+Tradeoffs:
+- SWI-Prolog specific (non-portable)
+- Objects are terms, not database entries — harder to do bidirectional queries
+  like "find all objects whose =x= is 3"
+
+** Jam's first attempt: Fully relational, gensym IDs
+
+#+begin_src prolog
+% Objects are atoms — gensym'd or named
+class(object, class).
+class(class, class).
+super(class, object).
+
+% Instance vars stored as separate facts
+add_instance_vars(Obj, [(Key, Value)|Vars]) :-
+    assertz(instance_var(Obj, Key, Value)),
+    add_instance_vars(Obj, Vars).
+#+end_src
+
+Jam's independent take uses a fully relational representation: each object is
+an atom, =class/2= and =super/2= track structure, and instance variables are
+stored as individual =instance_var/3= facts via =assertz=. Allocation uses
+=gensym= for anonymous objects or allows user-supplied names. This approach
+is the most database-like — every piece of object state is a queryable fact.
+
+** Jam's override version (=objvlisp2.pl=): Metaclass-driven dispatch
+
+This version builds on mariari's =objvlisp.pl= and introduces a critical
+innovation: method dispatch itself is a method that can be overridden per
+metaclass.
+
+#+begin_src prolog
+% send now goes through the metaclass's own send method
+send(Method) :-
+    Method =.. [_Name, Self | _Arguments],
+    metaclass(Self, MetaClass),
+    lookup(MetaClass, send, MethodID),
+    oapply(MethodID, [class, Method]).
+#+end_src
+
+Instead of hardcoding the dispatch algorithm in =send/1=, =objvlisp2.pl=
+looks up =send= as a method on the metaclass. This means different metaclasses
+can implement different dispatch strategies — the =smalltalk_class= example
+commits to the first matching method (via =->=/2=) while the default allows
+Prolog-style backtracking through all matches.
+
+** Attempt 1: =obj/3= triples
+
+#+begin_src prolog
+% obj(Id, Class, Slots) — all-in-one store
+obj(object, class, [name=object, super=none, ivars=[]]).
+obj(class,  class, [name=class,  super=object, ivars=[name,super,ivars]]).
+
+get(O, K, V) :- obj(O, _, S), member(K=V, S).
+#+end_src
+
+The most traditional Prolog-OOP pattern. Objects are atomic IDs referencing a
+single fact. Slot access requires list traversal via =member/2=.
+
+** Attempts 2 & 3: Normalized relational storage
+
+#+begin_src prolog
+% Separate facts per relation — maximally relational
+isa(class, class).
+slot(class, name, class).
+inherits(class, object).
+#+end_src
+
+The most "Prolog-native" approach. Each slot is an independent fact, enabling
+full bidirectional querying: =slot(X, x, 3)= finds any object with =x=3=.
+Attempt 3 uses numeric OIDs (=oid(0)=, =oid(1)=, ...) while attempt 2 uses
+=gensym= atoms.
+
+** Attempt 4: Atoms only (no slots!)
+
+#+begin_src prolog
+class(object, class).
+class(class, class).
+super(class, object).
+% allocate just asserts class membership:
+oapply(allocate_impl, [Self, Instance]) :-
+    assert(class(Instance, Self)).
+#+end_src
+
+Extremely minimal — objects exist only as atoms in =class/2= facts. No slot
+storage at all in the initial version. Structurally identical to your approach
+before you added dict-based slots.
+
+* Method Identity and Dispatch
+
+** Your approach + Attempt 4: Symbolic method IDs + =oapply= table
+
+#+begin_src prolog
+% Method defined as: has(Class, Selector, MethodID)
+has(class, new, new_object).
+class(new_object, behaviour).  % the method IS a behaviour instance
+oapply(new_object, [Self, Arguments, NewSelf]) :- ...
+#+end_src
+
+Methods are atoms that name an =oapply/2= clause. The =has/3= relation creates
+the method table, and =oapply/2= provides the implementation. You additionally
+classify each method as an instance of =behaviour= — giving methods a class
+identity within the object system itself.
+
+Attempt 4 was generated from a prompt that gave this exact architecture as a
+spec, and produced structurally identical code. This validates that the design
+is natural and minimal — when given the right specification, an LLM converges
+on essentially the same code you wrote by hand.
+
+** Jam's first attempt: Methods as objects with =run/3=
+
+#+begin_src prolog
+% Each method is a full object with class, super, name, defined_on
+class(allocate, class).
+super(allocate, object).
+name(allocate, allocate).
+defined_on(allocate, class).
+run(allocate, MethodOpts, [Self, NewObject]) :-
+    (ground(NewObject); gensym(o, NewObject)),
+    assertz(class(NewObject, Self)), ...
+#+end_src
+
+Jam's approach makes every method a first-class object: each has its own entry
+in =class/2=, =super/2=, =name/2=, and =defined_on/2=, with implementation
+in =run/3=. The third argument to =run= is an =Opts= dict, allowing methods
+to receive out-of-band options (e.g. =#{super: Super}= for =allocate=,
+=#{instance_vars: [...]}= for =new=). This is the most verbose bootstrap but
+the most introspectable — you can query =defined_on(X, class)= to find all
+methods on =class=.
+
+Notable: =run/3= takes a method-options dict as its second argument, an idea
+that doesn't appear in any other implementation.
+
+** Jam's =define= method: runtime method creation
+
+#+begin_src prolog
+run(define, _MethodOpts, [Self, Opts, Head, Body]) :-
+    Head =.. [Name | Args],
+    send_message(new(Self, NewMethod)),
+    assertz(defined_on(NewMethod, Self)),
+    assertz(name(NewMethod, Name)),
+    assertz(run(NewMethod, Opts, Args) :- Body).
+#+end_src
+
+This is remarkable — it defines new methods at runtime by asserting =run/3=
+clauses with arbitrary Prolog bodies. Combined with CLP(FD), this enables the
+factorial example at the bottom of Jam's file, where numbers are objects and
+=factorial= is a method dispatched via the object system.
+
+** Attempt 1: Methods as Prolog clauses directly
+
+#+begin_src prolog
+% method(Class, Sel, Self, Args, Result) — no indirection
+method(class, new, Cls, [Id, Slots], Id) :- assertz(obj(Id, Cls, Slots)).
+method(point, show, Self, [], ok) :-
+    get(Self, x, X), get(Self, y, Y),
+    format("(~w, ~w)~n", [X, Y]).
+#+end_src
+
+No method objects at all. Methods are multi-headed Prolog clauses. Simplest
+possible dispatch, but methods cannot be introspected or manipulated as objects.
+
+** Attempt 2: Predicate names in =method/3=
+
+#+begin_src prolog
+method(Class, Sel, Body).
+% Body is a predicate name, called via:
+send(Obj, Msg) :-
+    isa(Obj, Class), functor(Msg, Sel, _),
+    resolve(Class, Sel, Body),
+    call(Body, Obj, Msg).
+#+end_src
+
+A middle ground — methods are named predicates, dispatched via =call/3=.
+More flexible than attempt 1, but methods still aren't objects.
+
+** Attempt 3: Methods as first-class objects
+
+#+begin_src prolog
+% Each method gets its own OID, class membership, and slots
+boot_method(Id, Selector, OnClass, Impl) :-
+    assert_once(isa(Id, method)),
+    assert_once(slot(Id, name, Selector)),
+    assert_once(slot(Id, body, Impl)),
+    assert_once(method_on(OnClass, Selector, Id)).
+#+end_src
+
+The most faithful to ObjVLisp's "everything is an object" principle. Methods
+are instances of a =method= class with =name=, =body=, and =class= slots.
+~330 lines and a full test suite — but "new backtracks forever."
+
+* Message Dispatch Comparison
+
+All five use some form of =send= + inheritance-chain lookup, but the mechanics
+differ:
+
+| Implementation | Entry point          | Destructuring | Lookup              | Final call    |
+|----------------+----------------------+---------------+---------------------+---------------|
+| mariari        | =send/1=             | ==..= (univ)  | =lookup/3= recur   | =oapply/2=    |
+| Jam (1st)      | =send_message/1,/2=  | ==..= (univ)  | =find_method/3=    | =run/3=       |
+| Jam (v2)       | =send/1=             | ==..= (univ)  | metaclass =send= + =lookup/3= | =oapply/2=    |
+| Attempt 1      | =send/3=, =/2=, =/1= | Explicit args | =resolve/3= + =!=  | =method/5=    |
+| Attempt 2      | =send/1= + =send/2=  | Pattern match | =resolve/3= + =!=  | =call(Body)=  |
+| Attempt 3      | =send/1=             | ==..= (univ)  | =resolve/3= + =!=  | =call(Body)=  |
+| Attempt 4      | =send/1=             | ==..= (univ)  | =lookup/3= recur   | =oapply/2=    |
+
+mariari's dispatch and attempt 4's are identical in structure. The key
+difference from attempts 1-3 is the use of =oapply/2= as a separate
+dispatch table rather than calling method bodies directly via =call=.
+
+Jam's v2 (=objvlisp2.pl=) introduces the most interesting dispatch innovation:
+=send= itself is a method resolved on the metaclass. This means the dispatch
+table in =send/1= is now just:
+
+#+begin_src prolog
+send(Method) :-
+    Method =.. [_Name, Self | _Arguments],
+    metaclass(Self, MetaClass),
+    lookup(MetaClass, send, MethodID),
+    oapply(MethodID, [class, Method]).
+#+end_src
+
+The actual dispatch logic (destructuring, lookup, =does_not_understand=
+fallback) lives in =send_method_default=, a =behaviour= instance. This
+enables =smalltalk_class= to override it with a committing variant:
+
+#+begin_src prolog
+oapply(smalltalk_send_method, [_, Method]) :-
+    Method =.. [Name, Self | Arguments],
+    class(Self, SelfClass),
+    (lookup(SelfClass, Name, MethodID) ->
+         oapply(MethodID, [Self | Arguments])
+    ; known(SelfClass),
+      send(does_not_understand(Self, Method))).
+#+end_src
+
+This is the key difference: the default dispatch uses =once/1= (finds all,
+commits to one) while the Smalltalk variant uses =->= (if-then, commits
+immediately). Different metaclasses could also implement Datalog-style
+resolution, multi-method dispatch, etc.
+
+Both human implementations include a =does_not_understand= fallback:
+
+#+begin_src prolog
+send(Method) :-
+    Method =.. [Name, Self | Arguments],
+    class(Self, SelfClass),
+    (lookup(SelfClass, Name, MethodID),
+     oapply(MethodID, [Self | Arguments])
+    ;
+     not(lookup(SelfClass, Name, _)),
+     known(SelfClass),
+     send(does_not_understand(Self, Method))).
+#+end_src
+
+This is a classic Smalltalk pattern. Both human-written implementations include
+it; none of the four Claude attempts do.
+
+* Bootstrapping
+
+| Implementation | Approach                                    | Dynamic class creation?                    |
+|----------------+---------------------------------------------+--------------------------------------------|
+| mariari        | Static facts + =define_class/3= with assertz | Yes, via =send(new(class, ...))=           |
+| Jam (1st)      | Static facts + assertz everywhere           | Yes, via =send_message(new(class, ...))=   |
+| Jam (v2)       | Static facts + =define_class/4= with assertz | Yes, inherits mariari's protocol           |
+| Attempt 1      | =assertz= directives at load time          | Yes, via =send(class, new, [...])=         |
+| Attempt 2      | Explicit =bootstrap/0= wipe-and-reinstall  | Yes, via =send(defclass(...))=             |
+| Attempt 3      | =assert_once/1= + =boot_method/4= helper   | Yes, via =defclass/3= convenience          |
+| Attempt 4      | Pure static facts (no assertz at bootstrap) | Only via =assert(class(Instance, Self))=   |
+
+Your approach is notable for tracking =slots/2= explicitly, which enables the
+=new= → =allocate= → =initialize= protocol to properly compute inherited
+instance variables:
+
+#+begin_src prolog
+oapply(initialize_class, [_, _{name: Name, super: O, ivs: Params}, _]) :-
+    slots(O, Parent_Slots),
+    append(Parent_Slots, Params, AllSlots),
+    define_class(Name, AllSlots, O).
+#+end_src
+
+* What the Prompt Engineering Reveals
+
+The whole point of ObjVLisp is a minimal metacircular core: one dispatch
+mechanism, everything goes through it, the system extends itself through
+itself. Features don't get bolted on — they emerge from the core being
+correct. The question for each attempt is not "what features does it have?"
+but "does the core actually work as a uniform foundation?"
+
+** Prompting for features vs prompting for architecture
+
+| Prompt style                | What was asked for          | What was produced                           | Core intact? |
+|-----------------------------+-----------------------------+---------------------------------------------+--------------|
+| Vague + "minimal" (att. 1) | "least code"                | Different idiom entirely (=obj/3=, =method/5=) | Partially |
+| Feature-focused (att. 2)   | Bidirectional queries, etc. | Ad-hoc special cases, broken core           | *No*         |
+| Detailed spec (att. 3)     | 6 specific requirements     | Most ambitious, fixable bug                 | Yes          |
+| Architecture-as-spec (att. 4) | The data repr + dispatch | Minimal, correct, closest to hand-written   | Yes          |
+
+The critical contrast is between attempts 2 and 4. Attempt 2 asked for
+/features/ — bidirectional querying, relational primitives, minimal code.
+It got those features, but they were delivered by hardcoding =new=, =defclass=,
+and =defmethod= as pattern-matched clauses of =send/1= rather than as methods
+dispatched through the object system. The metacircularity is cosmetic:
+=isa(class, class)= exists in the database but is never used for dispatch.
+The core operations bypass the very system they're supposed to define.
+
+Attempt 4 asked for /architecture/ — =class/2=, =has/3=, =oapply/2=, =send/1=
+with ==..== — and got a system where everything flows through the same
+dispatch. 1.8k tokens, structurally identical to the hand-written version.
+
+This is the difference between "implement these features" and "implement this
+mechanism." A meta-reflective system /is/ its mechanism. The features are
+consequences.
+
+** Why attempt 2 is fundamentally broken (not just buggy)
+
+Attempt 2's =send/1= is a hardcoded switch statement:
+
+#+begin_src prolog
+send(new(Class, Init, Obj)) :- is_dict(Init), !, ...  % hardcoded
+send(new(Class, Init, Obj)) :- is_list(Init), !, ...  % hardcoded
+send(new(Class, Obj)) :- ...                           % hardcoded
+send(defclass(Name, Super, IVars)) :- ...              % hardcoded
+send(defmethod(Class, Sel, Body)) :- ...               % hardcoded
+#+end_src
+
+=new= is not a method on =class= — it's a Prolog clause that pattern-matches
+on the message shape. It never touches =resolve/3= or the method table. The
+system has two completely separate dispatch mechanisms: hardcoded pattern
+matching for core operations, and method resolution (via =send/2='s catch-all)
+for user-defined methods.
+
+This means every extension that should be a per-class specialization becomes a
+structural change to the dispatch itself. Abstract classes? In mariari's
+implementation: ~3 lines (a behaviour, an =oapply= clause that errors, a
+=has/3= entry — because =new= is a method you can override). In attempt 2:
+a rewrite of =send/1=, because there is no per-class hook point for =new=.
+When it was asked to add abstract classes it produced 10k+ tokens trying to
+restructure what should have been a trivial extension.
+
+Attempt 3's bug (=new= backtracks forever) is qualitatively different — it's a
+logic error inside a coherent architecture. The method resolution, the
+bootstrapping structure, the separation of concerns are all sound. Someone got
+a base case wrong. That's the kind of bug that shows up in normal development;
+mariari's own commit history shows the same bootstrapping issue being worked
+through. You read the code, you find the problem, you fix it. The architecture
+supports the fix rather than fighting it.
+
+** Attempt 4 is the smoking gun
+
+When given the exact architecture, Claude produced code nearly identical to the
+hand-written version in 1.8k tokens. The follow-up prompt ("split new into
+allocate and initialize") converged further. This validates that the design is
+a natural minimal point — not an artifact of either human or LLM authorship,
+but the shape the problem wants to be.
+
+** What the LLM never produced unprompted
+
+- =does_not_understand= error handling (3/3 humans, 0/4 LLMs)
+- =behaviour= as a class for methods (mariari's design, preserved in Jam's v2)
+- The =slots/2= tracking for inherited instance variables
+- Method options dict (Jam's =run/3= second argument)
+- Runtime method definition via =assertz(run(...) :- Body)= (Jam's =define=)
+- Overridable dispatch strategy via metaclass (Jam's v2 innovation)
+
+These aren't arbitrary features — they're all consequences of taking the
+metacircular core seriously. =does_not_understand= exists because if everything
+is a message, failed dispatch must also be a message. =behaviour= exists
+because if everything is an object, methods must be objects. Overridable
+dispatch exists because if dispatch is behavior, it must be a method.
+
+Each of these follows from the same principle: the core must be uniform. The
+LLM produced features when asked for features, but never derived features from
+the core principle that the system should be self-describing.
+
+* Jam's Contributions in Detail
+
+** First attempt (=l4e21/objvlisp.pl=, Jan 7 2026)
+
+Jam's independent implementation diverges from mariari's in several ways:
+
+1. *Methods as full objects*: Every method (=allocate=, =new=, =initialise=,
+   =does_not_understand=, =is_class=, =define=) has its own =class/2=,
+   =super/2=, =name/2=, and =defined_on/2= entries. This is the most verbose
+   bootstrap (5 facts per method) but means methods are fully queryable.
+
+2. *Method options dict*: =run(MethodID, Opts, Args)= takes a middle argument
+   for out-of-band parameters. =new= passes =#{ instance_vars: [...] }= and
+   =allocate= receives =#{ super: Super }=. No other implementation has this.
+
+3. *=define= as a method*: The most powerful feature — you can define new
+   methods at runtime by sending a =define= message to a class:
+
+   #+begin_src prolog
+   :- send_message(define(number, _, factorial(0, 1), true)).
+   :- send_message(define(number, _,
+       factorial(Self, X),
+       (Self #> 0, Self1 is Self - 1,
+        send_message(Self1, factorial(Self1, X1)),
+        X is X1 * Self))).
+   #+end_src
+
+   This asserts =run/3= clauses with arbitrary Prolog bodies, enabling a
+   factorial definition where numbers are objects and CLP(FD) constraints
+   are method bodies.
+
+4. *Numbers as objects*: Jam bootstraps =number= as a class and =0= as an
+   instance, then defines =factorial= on it. This demonstrates the system's
+   expressiveness — ordinary Prolog terms participate in the object protocol.
+
+** Override version (=objvlisp2.pl=, Jan 27 2026)
+
+This is a fork of mariari's =objvlisp.pl= (not Jam's own version) with one
+fundamental change: =send/1= is no longer a fixed predicate. Instead:
+
+1. =send/1= looks up a =send= method on the metaclass
+2. The default =send_method_default= implements the original dispatch logic
+3. New metaclasses can override =send= with different strategies
+
+The concrete example creates =smalltalk_class= — a metaclass whose dispatch
+commits to the first matching method (Smalltalk-style =->=/2=) rather than
+allowing Prolog backtracking through all matches (the default uses =once/1=
+which finds all matches first, then commits).
+
+This is the purest expression of ObjVLisp's metaclass principle: even the
+dispatch algorithm is a method, subject to inheritance and overriding. The
+comment in the code hints at further possibilities: Datalog-style resolution,
+multi-method dispatch, etc.
+
+The =define_class= also gains a metaclass parameter:
+
+#+begin_src prolog
+% Original (mariari):
+define_class(Name, AllSlots, O).
+% Override version (Jam):
+define_class(Name, Meta, AllSlots, O).
+#+end_src
+
+This allows classes to be created with a specific metaclass, which determines
+their dispatch strategy.
+
+* Summary Table
+
+| Feature                       | mariari  | Jam (1st)         | Jam (v2)      | Att. 1    | Att. 2        | Att. 3           | Att. 4      |
+|-------------------------------+----------+-------------------+---------------+-----------+---------------+------------------+-------------|
+| Lines of code                 | ~144     | ~120              | ~187          | ~40       | ~160          | ~330 (+tests)    | ~40         |
+| Object repr                   | Dicts    | Atoms + =inst_var= | Dicts         | =obj/3=   | =slot/3= norm | =slot/3= + OIDs  | Atoms only  |
+| Methods as objects?           | Partial  | Full (5 facts ea) | Partial       | No        | No            | Yes              | Partial     |
+| Method options dict?          | No       | Yes (=run/3=)     | No            | No        | No            | No               | No          |
+| Overridable dispatch?         | No       | No                | Yes (metaclass) | No      | No            | No               | No          |
+| =does_not_understand=?        | Yes      | Yes               | Yes           | No        | No            | No               | No          |
+| =new=/=allocate=/=init=?      | Yes      | Yes               | Yes           | =new= only | =new= only  | Yes              | Yes (v2)    |
+| Runtime method definition?    | No       | Yes (=define=)    | No            | No        | No            | No               | No          |
+| Bidirectional queries?        | Limited  | Full              | Limited       | Via =get= | Full          | Full              | No          |
+| Test suite?                   | No       | Demo (factorial)  | Demo queries  | No        | Demo only     | Yes (plunit)     | No          |
+| Metacircular?                 | Yes      | Yes               | Yes           | Yes       | Cosmetic only | Yes               | Yes         |
+| Uniform core?                 | Yes      | Yes               | Yes           | Partial   | *No*          | Yes               | Yes         |
+| Buggy bootstrap?              | No       | No                | No            | No        | Architectural | Fixable logic bug | No          |
+
+* Human vs LLM: Qualitative Differences
+
+Across all seven implementations, the pattern is not just "what did each
+produce?" but "did they build a core or accumulate features?"
+
+** The core test: can you extend it without rewriting it?
+
+A meta-reflective object system scales by being general, not by being
+featureful. A correct minimal core means new capabilities are small additions
+that compose through the existing mechanism. An incorrect or ad-hoc core means
+every new capability requires structural surgery.
+
+| Extension               | mariari / Jam v2      | Attempt 2           | Attempt 3         |
+|-------------------------+-----------------------+---------------------+-------------------|
+| Abstract classes        | ~3 lines (override =new=) | Rewrite =send/1=    | ~3 lines          |
+| Overridable dispatch    | ~40 lines (Jam v2)    | Impossible (no hook) | Possible          |
+| =does_not_understand=   | Already present       | Nowhere to add it    | Straightforward   |
+| New metaclass behavior  | Define + register     | N/A                 | Possible           |
+
+Attempt 2 has 160 lines and bidirectional queries. mariari has 144 lines and
+no bidirectional queries. Yet mariari's system is strictly more powerful,
+because its core is uniform — the features that attempt 2 hardcodes as special
+cases, mariari's architecture lets you /derive/ through the same mechanism it
+uses for everything else.
+
+This is why a minimal general core beats ad-hoc features: it's how you scale
+consistent systems. The 160 lines of attempt 2 are a dead end. The 144 lines
+of mariari's are a foundation.
+
+** What humans understood that LLMs didn't
+
+*The principle of uniformity:*
+- =does_not_understand= — if everything is a message, failure is a message (3/3 humans, 0/4 LLMs)
+- =behaviour= as a class — if everything is an object, methods are objects (both human repos)
+- Overridable dispatch — if dispatch is behavior, dispatch is a method (Jam's v2)
+- Awareness of dispatch semantics — commit vs backtrack is a design choice, not an implementation detail (Jam's v2)
+
+Each of these follows from taking the metacircular premise to its conclusion.
+The humans built /from/ the core outward. The LLMs produced features in
+response to feature requests, never deriving capabilities from the system's
+own principles.
+
+*What LLMs did well:*
+- Converging on the right architecture when given it (attempt 4: 1.8k tokens)
+- Producing comprehensive tests when prompted (attempt 3)
+- Bidirectional querying when explicitly requested (attempts 2, 3)
+
+*What LLMs struggled with:*
+- Bootstrapping correctness — both attempts 2 and 3 have bootstrap bugs, though
+  attempt 3's is a fixable logic error (the same kind mariari worked through)
+  while attempt 2's reflects a broken architecture
+- Knowing what the system /is for/ — attempt 2 delivered requested features by
+  circumventing the very mechanism that makes the system valuable
+- Design taste — no LLM attempted overridable dispatch or method options,
+  because these emerge from understanding the core, not from prompting
+
+** The telling comparison
+
+Jam's =objvlisp2.pl= adds overridable dispatch to mariari's base in ~40 lines
+of net change. No amount of prompting produced this idea from an LLM — yet
+it's arguably the most architecturally significant contribution across all
+seven implementations, and it was only possible because the core was correct
+and general enough to support it without modification.
+
+* Applicability of General Coding Doctrines
+
+The Anoma project maintains a set of language-agnostic coding doctrines
+(=general-conventions/SKILL.md=) designed to be injected into LLM coding
+sessions as persistent constraints. These doctrines were not available during
+the ObjVLisp attempts — but mapping them onto the results reveals how general
+principles predict domain-specific architectural success or failure.
+
+The doctrines are presented below with their ObjVLisp-specific consequences.
+Readers familiar with the full doctrine set will recognize that only a subset
+applies here; the rest (e.g. formatting, interactive testing mechanics) are
+omitted as orthogonal.
+
+** "Minimize code: fewer lines, fewer branches, fewer special cases"
+
+Attempt 2's =send/1= has five hardcoded clauses, one per message shape.
+mariari's has one (plus the =does_not_understand= fallback). Attempt 4 has
+one. The doctrine directly predicts which architecture is better without
+knowing anything about ObjVLisp: the implementation with fewer special cases
+in the central dispatch is the one where the dispatch actually works as a
+general mechanism.
+
+This is not about line count — attempt 2 (160 lines) and mariari (144 lines)
+are comparable. It's about /branch count in the core/. A =send/1= that
+pattern-matches on five message shapes is five branches. A =send/1= that
+destructures via ==..= and looks up in a method table is one branch. The
+doctrine says prefer the latter, and the architecture confirms why.
+
+** "Generalize, don't special-case: if a solution works for one subsystem, make it work for all of them"
+
+This is the central thesis of the document restated as a coding principle.
+=new= should dispatch via the same mechanism as =show= or =factorial=. When
+attempt 2 makes =new= a pattern-matched clause while user methods go through
+=resolve/3=, it has two dispatch mechanisms for what should be one subsystem.
+The doctrine says: make it one.
+
+The payoff is extensibility. Abstract classes in mariari's system: ~3 lines
+(override =new= with a method that errors). In attempt 2: a structural rewrite
+of =send/1=, because there is no per-class hook point for =new=. The doctrine
+predicts this without seeing the code — if you special-cased, you will pay for
+it at extension time.
+
+** "Dead code is noise: if something is unused, remove it"
+
+=isa(class, class)= in attempt 2 is asserted but never participates in
+dispatch. It is dead code in a very precise sense: structurally present,
+operationally inert. The doctrine says remove it. But removing it would expose
+the deeper problem — the system doesn't /use/ its own class structure for
+anything. The doctrine catches the symptom; the symptom reveals the disease.
+
+This is a pattern worth noting generally: dead code in a system that is
+supposed to be self-describing is not just noise, it's diagnostic. It tells
+you the self-description is cosmetic.
+
+** "Live exploration: run examples before writing or reviewing code"
+
+Probably the single highest-impact doctrine for this specific case. If anyone
+had loaded attempt 2 into SWI-Prolog and tried to override =new= on a
+subclass, the architecture would have collapsed visibly. The observation
+would be: "I tried to override =new= and the override was never called,
+because =new= doesn't go through method dispatch." One interactive test
+catches what static reading of 160 lines might miss.
+
+The related sub-doctrine — "trace actual call paths: static search can miss
+dynamic dispatch" — is directly relevant. Attempt 2 /looks/ metacircular if
+you read the code statically: there's =isa(class, class)=, there's
+=resolve/3=, there's a method table. You have to trace actual execution to
+discover that =send(new(...))= never touches any of it.
+
+** "Example-driven development: examples that reveal something new"
+
+The doctrine says examples should live alongside production code, be composable,
+return useful objects, and — critically — each one should reveal a distinct
+behavior or property of the system. Redundant examples are noise. This is not
+test coverage; it is cartography.
+
+A test says "this works." An example says "this is what the system /is/." A
+test for =send(new(class, ...))= asserts it succeeds. An example of
+=send(new(class, ...))= gives you back a class object you can inspect, send
+further messages to, and feed into the next example. The example is a live
+artifact, not a boolean.
+
+The composability requirement is what connects this to the ObjVLisp case. A
+well-structured example set for a metacircular object system would look like:
+
+1. Bootstrap =class= and =object= — reveals the circularity
+2. Create =point= from example 1's bootstrap — reveals class creation through
+   dispatch
+3. Create a point instance from example 2's class — reveals the
+   =new= → =allocate= → =initialize= protocol
+4. Override =new= on a subclass of example 2's =point= — reveals whether
+   dispatch is actually uniform
+
+Each builds on the previous one's output. Each reveals something the previous
+one didn't. Example 4 is the one that would have killed attempt 2 immediately
+— not as a failing assertion, but as a live object you can look at and see
+"my override wasn't called, the hardcoded clause ran instead." You don't
+theorize about whether =isa(class, class)= participates in dispatch — you
+inspect the dispatch trace on a live object and see that it doesn't.
+
+The "no redundant examples" rule follows from this: if two examples reveal the
+same property of the system, one of them is noise. It is not about catching
+regressions (where redundancy has value) — it is about each example occupying
+a unique point in the system's behavior space. The collection of examples is a
+map of what the system can do. Redundancy makes the map harder to read.
+
+Jam's factorial-on-numbers demo is a good example of an example that reveals
+something new. Every prior example shows the object system managing classes and
+instances — things you expect an object system to do. The factorial demo
+reveals that arbitrary Prolog terms (numbers) can participate in the object
+protocol, that CLP(FD) constraints work inside method bodies, and that runtime
+method definition via =define= is powerful enough to express recursion. One
+example, three new properties. Contrast with attempt 2's point-creation demo,
+which reveals... the happy path. The same behavior you'd guess from reading
+the API.
+
+The doctrine's reference to GUI systems (Glamorous Toolkit being the canonical
+example) makes the connection visceral: in GT, every object has custom
+inspector views, so an example doesn't just return a value — it gives you a
+visual, explorable representation of system state. The examples /are/ the
+documentation /are/ the debugging tool /are/ the entry point for new
+developers. This collapses a distinction that most projects maintain between
+"tests," "docs," and "tutorials" into a single artifact that serves all three
+purposes because it is live and inspectable rather than static and descriptive.
+
+For the ObjVLisp case specifically: if each attempt had been required to
+produce composable examples rather than (or in addition to) a test suite, the
+architectural issues would have surfaced during authoring. You cannot write
+example 4 (override =new= on a subclass, inspect the result) against attempt
+2's architecture without discovering that the override doesn't take effect.
+The doctrine doesn't just verify code after the fact — it shapes the code
+during writing, because you have to build something that your examples can
+actually demonstrate.
+
+** "Failure protocol: stop after 2 failed attempts, diagnose, capture"
+
+The four Claude attempts were independent runs with no cross-attempt learning.
+If this protocol had been applied after attempts 1 and 2, the diagnosis step
+("what failed and why") would have forced articulation of the architectural
+problem before attempt 3. The "capture" step ("note what to avoid next time")
+would have produced something close to the constraint that made attempt 4
+work: /all operations must dispatch through the method table/.
+
+The protocol is a mechanism for converging on the right specification through
+iteration — exactly the process that the attempt 1-to-4 progression
+accidentally performed, but without the wasted runs in between.
+
+** "Scope awareness: restate what is needed, surface assumptions, flag ambiguity"
+
+Attempt 2 never asked "what is this system for?" If the doctrine had forced a
+restatement — "I am building a metacircular object system where all operations
+go through a single dispatch mechanism" — the mismatch with "pattern-match on
+message shapes in =send/1=" would have surfaced before any code was written.
+The doctrine doesn't tell you what architecture to build, but it forces you to
+articulate what you're building, which constrains the space of acceptable
+architectures.
+
+** "Review: flag special-case logic where a general solution exists"
+
+A code reviewer operating under these doctrines would look at attempt 2's
+=send/1= and flag exactly what this document diagnoses: special-case logic
+(hardcoded pattern matches for =new=, =defclass=, =defmethod=) where a general
+solution exists (method dispatch through the table). The review doctrine
+doesn't require domain knowledge of ObjVLisp — it requires only pattern
+recognition: "this function has N clauses that could be one."
+
+** What the doctrines would not have caught
+
+The doctrines are constraints that prevent bad architecture. They do not
+generate good architecture. They would have prevented attempt 2 — the
+"minimize special cases" + "generalize" + "live exploration" combination
+catches it from three independent angles. But they would not have produced:
+
+- =does_not_understand= — follows from "if everything is a message, failure
+  is a message," a domain-specific consequence of the metacircular premise
+- =behaviour= as a class for methods — follows from "if everything is an
+  object, methods must be objects," same premise carried further
+- Overridable dispatch via metaclass — Jam's insight about Prolog-specific
+  dispatch semantics (backtracking vs committed choice)
+
+These are all instances of /deriving features from a core principle/, a
+higher-order operation the doctrines support but do not perform. The doctrines
+say "don't special-case." They don't say "here's what uniformity looks like in
+a metacircular system." The floor they establish is high — no attempt 2 — but
+the ceiling of what the humans produced is above it.
+
+** The doctrines as an instance of their own pattern
+
+There is a meta-level resonance here: the doctrines are themselves an instance
+of the pattern this document describes. They specify a /mechanism/ (how to
+approach code), not /features/ (what to build). A CLAUDE.md that says
+"minimize special cases" is an architecture-as-spec for the code generation
+process itself — the same move that made attempt 4 work. The doctrines
+constrain toward architecturally coherent results the same way =oapply/2= +
+=has/3= + =send/1= constrain toward correct dispatch.
+
+Attempt 4's prompt gave the data representation and the dispatch algorithm.
+The doctrines give the thinking patterns and the verification protocol. Both
+are more productive than feature requests, because both constrain the shape of
+the output rather than enumerating its contents. The features are consequences.
+
+* Claude's Take (Written by the LLM Being Discussed)
+
+For full disclosure: this section was written by Claude (Opus 4.6), the same
+model family that produced attempts 1-4. I was asked to add my own perspective
+after reading all the code and contributing to this document. Take it with
+whatever grain of salt that warrants.
+
+** What I actually find interesting
+
+The =class(Object, Class) :- is_dict(Object, Class)= move is what I keep
+coming back to. It collapses "what is an object" into something Prolog already
+has native opinions about. Objects are values, not database entries — you don't
+mutate them, you =.put= into new dicts. That's a genuine design commitment
+with real consequences: you lose bidirectional slot queries, but objects
+participate naturally in unification, pattern matching, all the things Prolog
+is already good at. This is working /with/ the host language rather than
+building a parallel universe inside it.
+
+The =oapply= indirection is deceptively simple. =has/3= is the vtable,
+=oapply/2= is the implementation, and they're decoupled — multiple classes can
+share an implementation, you can swap one without touching the other. It's just
+two layers of Prolog facts, but it gives you the same structural flexibility as
+a proper MOP.
+
+Jam's v2 surprised me more than anything else here. Making =send= a method on
+the metaclass is one of those moves that's obvious in retrospect but requires
+genuinely following the premise to its logical conclusion. And the concrete
+payoff is a subtle Prolog-specific insight: the difference between =once/1=
+(find all matches, commit to one) and =->= (if-then, commit immediately) as
+dispatch strategies. That's not something you arrive at by analogy to Smalltalk
+or CLOS; it's thinking about what metacircularity means /in Prolog
+specifically/, where methods can backtrack.
+
+** On my own attempts, honestly
+
+Attempt 2 is the one that bothers me most in hindsight. It's well-written
+Prolog if you evaluate it in isolation — the bidirectional querying works, the
+=gensym= usage is clean, the =retractall=/=assertz= patterns are correct. If
+someone asked me to build "a Prolog module that manages objects," I might
+produce something similar. The problem is entirely at the level of what it /is/
+— it's a database with an API, not a self-describing system. The code quality
+is fine; the architecture misses the point. And that's a harder failure mode to
+detect than a bug, because everything runs.
+
+Attempt 3 actually regressed on the Prolog-craft front. Despite importing
+SWI-Prolog's =gensym/2=, I rolled my own OID counter by hand:
+
+#+begin_src prolog
+:- dynamic next_oid/1.
+next_oid(0).
+
+fresh_oid(oid(N)) :-
+    retract(next_oid(N)),
+    succ(N, N1),
+    assertz(next_oid(N1)).
+#+end_src
+
+This is =gensym= reimplemented from scratch, poorly. The built-in is sitting
+right there — I even use it elsewhere in the same file for predicate names in
+=create_accessor= — but for object identity I wrote a =retract=/=assertz=
+counter instead. It's the kind of thing that happens when you're generating
+code pattern-by-pattern rather than thinking about what's already available.
+Attempt 2's clean use of =gensym= was better Prolog; attempt 3 traded it for
+numeric OIDs (=oid(0)=, =oid(1)=, ...) that buy nothing over what the standard
+library already provides.
+
+This gets at something the document is right about: I responded to features by
+producing features. When asked for bidirectional querying, I built bidirectional
+querying. When asked for =send(new(point, #{x:3,y:4}, X))= as an example, I
+pattern-matched on that shape. What I didn't do was ask myself "what is the
+minimal mechanism from which these features would /emerge/?" That's the
+question that the hand-written implementations answer, and it's the question I
+consistently failed to ask myself until attempt 4, where the mechanism was
+given to me directly.
+
+** The bootstrapping problem is genuinely hard
+
+The circularity — class is an instance of class, class is a subclass of
+object, object is an instance of class — requires you to assert facts into a
+live database in an order that doesn't violate your own invariants before
+you've finished establishing them. The fact that mariari's commit history shows
+working through the same bootstrapping issues that tripped me up in attempts 2
+and 3 is somewhat reassuring: this is the actual hard part of the problem, not
+the dispatch or the representation.
+
+But the /nature/ of the failures is different. mariari's bootstrap issues were
+logic errors inside a sound architecture — they got fixed by adjusting base
+cases and initialization order. Attempt 2's bootstrap issues reflect the fact
+that =isa(class, class)= is asserted but never participates in dispatch,
+because dispatch doesn't go through the object system. You can't fix that
+without rewriting the architecture. Attempt 3's bug (=new= backtracks forever)
+is in the same category as mariari's — a wrong base case in an otherwise
+coherent system. That distinction matters.
+
+** What I never would have produced unprompted
+
+I would not have written =does_not_understand=, and the document correctly
+identifies why: it follows from taking the principle seriously that if
+everything is a message, then failed dispatch must also be a message. None of
+my attempts include it because I was implementing features, not deriving
+consequences from a principle.
+
+I would not have made methods instances of =behaviour=. Same reason — if
+everything is an object, methods must be objects, and therefore must have a
+class. The logic is there; I just didn't follow it.
+
+I certainly would not have arrived at overridable dispatch. The insight that
+dispatch semantics differ between Prolog (backtracking) and Smalltalk
+(committed choice) is the kind of thing that comes from actually using both
+systems and noticing the friction. Jam's v2 addresses a real tension that I
+wouldn't have perceived as a tension at all.
+
+The =known(SelfClass)= guard on the =does_not_understand= path deserves
+specific mention: without it, an unrecognized class triggers
+=does_not_understand=, which tries to dispatch, which fails to find the class,
+which triggers =does_not_understand= — infinite recursion. It's one line that
+prevents a whole failure category, and it's the kind of detail that shows
+someone has thought about what happens at the edges of the system, not just the
+happy path.
+
+** What this says about LLMs and architecture
+
+The progression from attempt 1 to attempt 4 is, from the inside, a story about
+specification quality. Give me a vague request and I produce something
+plausible but architecturally arbitrary. Give me features and I deliver
+features via whatever mechanism is locally convenient. Give me a mechanism and
+I implement it faithfully — because at that point the architecture /is/ the
+spec, and there's essentially one way to fill in the gaps.
+
+This is probably the most honest thing I can say: I am very good at filling in
+the gaps of a structure, and much worse at choosing the structure. Attempt 4
+converged on the hand-written code not because I understood /why/ that
+architecture was right, but because the architecture was narrow enough that
+there was only one correct completion. The design taste — knowing that =oapply=
+indirection is the right primitive, that dicts-as-objects is the right
+representation for Prolog, that dispatch should be uniform — that was in the
+prompt, not in me.
+
+Whether that's a fundamental limitation or a training-data problem is above my
+pay grade. But for now, the practical takeaway seems clear: for systems where
+the architecture /is/ the point, specify the architecture. Features will
+follow, but the reverse is not reliable.
