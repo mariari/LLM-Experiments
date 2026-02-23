@@ -283,4 +283,17 @@ test(agreement_with_faults, [true]) :-
     all_committed(Net, [_-Expected | Rest]),
     maplist([_-Cmds]>>(Cmds = Expected), Rest).
 
+%% Works with different network sizes (7 replicas, f=2).
+test(seven_replicas, [true]) :-
+    fresh_network(7, Net0),
+    run_rounds([tx_a, tx_b, tx_c, tx_d, tx_e, tx_f], Net0, Net),
+    committed_commands(Net, 1, Cmds),
+    member(tx_a, Cmds).
+
+%% Quorum with 7 replicas is 5.
+test(quorum_7_replicas) :-
+    genesis(G),
+    qc_valid(qc(G, [1,2,3,4,5]), 7),
+    \+ qc_valid(qc(G, [1,2,3,4]), 7).
+
 :- end_tests(simulation).

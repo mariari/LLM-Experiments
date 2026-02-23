@@ -162,10 +162,9 @@ safe_to_vote(Block, State, _N) :-
 %% It also updates qc_high and tries to commit.
 
 on_proposal(Block, JustifyQC, S0, S3) :-
-    N = 4,  % TODO: parameterize
     update_qc_high(JustifyQC, S0, S1),
     try_commit(JustifyQC, S1, S2),
-    (   safe_to_vote(Block, S2, N)
+    (   safe_to_vote(Block, S2, _)
     ->  block_round(Block, Round),
         S3 = S2.put(last_voted, Round)
     ;   S3 = S2
