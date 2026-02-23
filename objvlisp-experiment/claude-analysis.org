@@ -1,0 +1,271 @@
+#+TITLE: Code-Level Analysis of the Four Claude ObjVLisp Attempts
+#+AUTHOR: Claude (Opus 4.6), February 2026
+
+Written after reading all four attempt source files, the existing analysis
+document, and the Anoma skill files (general-conventions, git-conventions,
+code-review, elixir-conventions). This is meant to complement the existing
+analysis.org by focusing on specific code-level observations rather than
+repeating the architectural argument.
+
+* What reading the code side-by-side reveals
+
+** Attempt 1 is honest about what it is
+
+The entire dispatch fits in one line:
+
+#+begin_src prolog
+send(O, M, A, R) :- obj(O, C, _), resolve(C, M, W), method(W, M, O, A, R).
+#+end_src
+
+This is a clean, minimal Prolog pattern: look up the object's class, walk the
+inheritance chain, call the matching =method/5= clause. No pretense of
+metacircularity beyond the bootstrap facts. The =resolve/3= uses cut correctly
+to commit to the first match in the class hierarchy.
+
+The =set/2= predicate is well-crafted — it uses =retract= + =select= +
+=assertz= in a pattern that handles both updating existing slots and adding new
+ones. It is the only attempt that provides a clean mutation primitive:
+
+#+begin_src prolog
+set(O, K, V) :-
+    retract(obj(O, C, S)),
+    (select(K=_, S, R) -> true ; R = S),
+    assertz(obj(O, C, [K=V|R])).
+#+end_src
+
+The weakness is that =method/5= is a static predicate — you can add clauses
+but there is no method table to query, override, or compose. Methods are code,
+not data. For a 40-line script, this is the right tradeoff. The problem is
+only that it was asked to be ObjVLisp and is not.
+
+** Attempt 2's =send/2= reveals the split personality
+
+There are two separate dispatch paths. =send/1= handles meta-messages (=new=,
+=defclass=, =defmethod=) by direct pattern matching. =send/2= handles
+user-defined messages through the method table:
+
+#+begin_src prolog
+send(Obj, Msg) :-
+    isa(Obj, Class),
+    functor(Msg, Sel, _),
+    resolve(Class, Sel, Body),
+    call(Body, Obj, Msg).
+#+end_src
+
+This =send/2= clause is actually correct — it does proper method resolution
+and dispatch. The problem is that the core operations never go through it.
+=send(new(point, #{x:3}, P))= hits =send/1='s pattern match, not =send/2='s
+method table. The system has a working dispatch mechanism that its own core
+operations ignore.
+
+The bidirectional querying is genuinely well done. =slot/3= as individual facts
+means =slot(X, x, 3)= works out of the box with Prolog's built-in indexing.
+The =ancestor/2= predicate is bidirectional. The =inspect/1= and =instances/2=
+helpers are clean. If you evaluated this as "a Prolog module for managing
+structured data with inheritance," it would score well.
+
+The =bootstrap/0= predicate uses =retractall= to wipe all state before
+reinstalling — this is idempotent but destructive. Every call to =bootstrap/0=
+destroys all user-defined classes and instances. No other attempt has this
+property.
+
+** Attempt 3 is the most ambitious and the most inconsistent
+
+The =boot_method/4= helper is the cleanest bootstrap mechanism across all four
+attempts:
+
+#+begin_src prolog
+boot_method(Id, Selector, OnClass, Impl) :-
+    assert_once(isa(Id, method)),
+    assert_once(slot(Id, name, Selector)),
+    assert_once(slot(Id, body, Impl)),
+    assert_once(method_on(OnClass, Selector, Id)).
+#+end_src
+
+Four facts per method, declarative, idempotent via =assert_once=. This is
+how you would want to bootstrap a system where methods are first-class objects.
+
+But then there is =defclass/3=, a convenience predicate that bypasses the
+object system entirely:
+
+#+begin_src prolog
+defclass(Name, Super, Slots) :-
+    retract_class(Name),
+    assertz(isa(Name, class)),
+    assertz(inherits(Name, Super)),
+    ...
+#+end_src
+
+This asserts facts directly rather than going through =send(new(class, ...))=.
+It exists because the =new= path has the backtracking bug — but having it
+means you can define classes without the bug manifesting, which hides the
+problem. The test suite uses =defclass/3= exclusively, so all tests pass
+despite =new= being broken.
+
+The =create_accessor/2= predicate dynamically generates accessor methods by
+asserting clauses with =gensym='d predicate names:
+
+#+begin_src prolog
+create_accessor(Class, SlotName) :-
+    gensym(accessor_, PredName),
+    Msg  =.. [SlotName, Self, Value],
+    Head =.. [PredName, Msg],
+    assertz((Head :- slot(Self, SlotName, Value))),
+    ...
+#+end_src
+
+This is the right approach for auto-generating slot accessors, and it is
+bidirectional — =send(x(P, X))= unifies X with P's x slot, and
+=send(x(P, 3))= succeeds if P's x is 3. The test suite verifies both
+directions.
+
+The inconsistency: =gensym= for accessor predicate names, but =fresh_oid= for
+object identity. Two different ID-generation mechanisms in the same file for
+no reason.
+
+** Attempt 4 is trivially correct
+
+The entire system:
+
+#+begin_src prolog
+class(object, class).  class(class, class).  super(class, object).
+
+send(Method) :-
+    Method =.. [Name, Self | Args],
+    class(Self, Class),
+    lookup(Class, Name, Impl),
+    oapply(Impl, [Self | Args]).
+
+lookup(Class, Name, Impl) :- has(Class, Name, Impl).
+lookup(Class, Name, Impl) :- super(Class, Super), lookup(Super, Name, Impl).
+#+end_src
+
+Plus three methods (=new=, =allocate=, =initialize=) defined as =has/3= +
+=oapply/2= entries. That is the whole thing.
+
+What makes it correct is that there is nothing to get wrong. =send/1= has one
+path. =lookup/3= has two clauses (local match, then recurse). Every method,
+including =new=, goes through the same path. There is no special-casing, so
+there is no place for the special-casing bugs that plague attempts 2 and 3.
+
+The iterated version (adding =allocate= + =initialize= split) adds 12 lines
+and changes one =oapply= clause. This is exactly the extensibility pattern the
+analysis document predicts: new capabilities as small additions that compose
+through the existing mechanism.
+
+* Through the lens of the skill files
+
+** general-conventions on attempt 2
+
+The "minimize code" doctrine is not about line count — attempt 2 (160 lines)
+and attempt 4 (40 lines) differ by 4x, but the real issue is branch count in
+the core. =send/1= in attempt 2 has 5 clauses for 5 message shapes. =send/1=
+in attempt 4 has 1 clause for all messages. The doctrine says prefer the
+latter; the architecture confirms why.
+
+The "generalize, don't special-case" doctrine catches the split dispatch
+problem directly. =new= should go through the same path as =norm= or
+=to_string=. When it doesn't, you get two subsystems where one should suffice.
+
+The "dead code is noise" doctrine catches =isa(class, class)= in attempt 2 —
+asserted but never used for dispatch. In a self-describing system, dead
+self-description is diagnostic: it tells you the self-description is cosmetic.
+
+** general-conventions on attempt 3
+
+The "unnecessary indirection is harmful" doctrine partially applies to
+=defclass/3=. It exists as a workaround for the broken =new= path, adding
+a second way to create classes. But it is also genuinely more convenient for
+the user. Whether this counts as unnecessary indirection depends on whether
+you consider the convenience sufficient justification. The doctrine would say:
+fix the =new= path, then =defclass/3= is a convenience wrapper that adds
+value. Right now it is a bypass that hides a bug.
+
+** code-review applied to attempt 2
+
+The code-review skill says to "flag special-case logic where a general solution
+exists." Attempt 2's =send/1= is the canonical example: five pattern-matched
+clauses where one =univ= + =lookup= clause handles all of them. A reviewer
+following the skill would flag this without needing to know what ObjVLisp is.
+
+The skill also says to flag "dead code: defined but never called." =resolve/3=
+in attempt 2 is called from =send/2= for user-defined methods, so it is not
+dead — but the core operations never touch it. The method table is partially
+dead: alive for user methods, dead for system methods.
+
+** The elixir-conventions skill is orthogonal
+
+The Elixir conventions deal with =with= chains, GenServer patterns, and state
+boundaries. These don't apply to Prolog. But the underlying principle in the
+"state boundaries" section — "choose where state lives based on queryability
+and crash tolerance" — maps onto the object representation question. Attempts
+2 and 3 chose individual facts (maximally queryable); attempt 4 chose atoms in
+=class/2= (minimal state, no slots). mariari chose dicts (values, not database
+entries). Each is a state-boundary decision with different tradeoffs.
+
+** The git-conventions skill maps onto the experiment design
+
+"One concern per topic" maps to "one prompting strategy per attempt." The
+experiment already follows this: each branch is one attempt, cleanly separated.
+
+"Base bug fixes on the commit that introduced the bug" maps to how you would
+fix attempt 3's backtracking issue: find the clause that fails to terminate,
+fix it there, don't add workarounds elsewhere. The =defclass/3= bypass in
+attempt 3 violates this — it works around the bug rather than fixing it.
+
+* What the test suite reveals about attempt 3
+
+Attempt 3 is the only one with a plunit test suite. Reading it carefully:
+
+- =test(create_point, [nondet])= — the =[nondet]= annotation means it accepts
+  multiple solutions. This masks the backtracking bug: the test passes because
+  it succeeds at least once, even if =new= would produce infinitely many
+  solutions.
+
+- =test(create_class_via_new, [nondet])= — this is the most important test,
+  the one that exercises metacircularity (creating a class by sending =new= to
+  =class=). It too is =[nondet]=, masking the infinite backtracking.
+
+- None of the tests check for determinism. A test like
+  =test(new_is_deterministic, [true]) :- send(new(point, #{x:1,y:2}, _))=
+  would have caught the bug immediately.
+
+This is an instance of the example-driven development doctrine: the tests
+reveal the happy path but not the boundary conditions. A composable example
+that chains =new= -> =modify= -> =new= would have hung, surfacing the bug
+during development.
+
+* Concrete doctrine that would help future attempts
+
+Based on reading all four attempts through the skill files, the minimal set
+of constraints that would prevent the failure modes observed:
+
+1. *All message dispatch must go through a single =send= predicate.* No
+   pattern-matching on message shapes in =send=; use =univ= (==..=) to
+   destructure, look up in the method table, call the implementation.
+   (Prevents attempt 2's split dispatch.)
+
+2. *Core operations (=new=, =allocate=, =initialize=) must be methods in the
+   method table, not built-in clauses.* Verify by checking that overriding
+   =new= on a subclass actually takes effect. (Prevents attempt 2's bypass.)
+
+3. *Tests must check determinism.* If =new= should produce exactly one result,
+   test it with =[true]= or =once/1=, not =[nondet]=. (Catches attempt 3's
+   backtracking bug.)
+
+4. *No workaround predicates for broken core paths.* If =send(new(class, ...))=
+   doesn't work, fix it rather than adding =defclass/3= as a bypass.
+   (Prevents attempt 3's hidden bug.)
+
+5. *The bootstrap should be static facts where possible.* =class/2=, =super/2=,
+   =has/3= as static Prolog facts at the top of the file. Only use =assertz=
+   for facts that genuinely need to be dynamic (new objects, new classes
+   created at runtime). (This is what attempt 4 does; attempts 2 and 3 use
+   =assertz= during bootstrap for facts that could be static.)
+
+These five constraints are derivable from the general-conventions skill alone
+(minimize special cases, generalize, dead code is noise, run examples). They
+are domain-specific instantiations of domain-independent principles. Injecting
+them as a preamble to the prompt — or better, having them in a CLAUDE.md for
+the project — would narrow the space of acceptable outputs to architectures
+that are either correct or wrong in fixable ways.

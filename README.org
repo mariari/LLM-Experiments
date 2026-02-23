@@ -1,8 +1,14 @@
-* ObjVlisp via claude
+#+TITLE: ObjVLisp via Claude
 
-I want to see how promting the agnets affect claude.
+I want to see how prompting the agents affect Claude.
 
-Each branch represents a different starting prompt.
+** Experiments
+
+The =objvlisp-experiment/= directory contains all four Claude attempts at
+generating an ObjVLisp-style reflective object system, along with analysis
+documents comparing them to hand-written implementations.
+
+See [[file:objvlisp-experiment/README.org][objvlisp-experiment/README.org]] for details.
 
 Interesting attempts:
 
@@ -16,3 +22,8 @@ Interesting attempts:
      system works algorithmically
    + It's too minimal too oneshot, but it's refactors are nice and can
      help the one shot
+
+** LLM Configuration
+
+This repository also includes Anoma's shared LLM configuration (merged from
+=anoma/llm=). See [[file:docs/README.org][docs/README.org]] for how to use the skill files.

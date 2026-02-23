@@ -1,0 +1,65 @@
+#+TITLE: ObjVLisp Experiment
+#+AUTHOR: mariari
+
+* Overview
+
+Four attempts at getting Claude to produce an ObjVLisp-style reflective object
+system in SWI-Prolog, each with a different prompting strategy. The goal was
+to see how prompt formulation affects whether the LLM produces a system with a
+coherent metacircular core vs one that merely accumulates requested features.
+
+Each attempt is in its own subdirectory with the original generated code.
+
+* Attempts
+
+** =attempt-1/= — Minimal prompt (~700 tokens)
+
+Prompt: "make a reflective object system in the vein of objvlisp, least code"
+
+Produced =objvlisp.pl=: 40 lines, =obj/3= triples, =method/5= clauses.
+Compact but a different idiom entirely — traditional Prolog-OOP rather than
+ObjVLisp's metacircular architecture.
+
+** =attempt-2/= — Feature-focused prompt (~10k+ tokens)
+
+Prompt: "reflective object system like objvlisp, bidirectional querying,
+minimal relational primitives"
+
+Produced =objvlisp.pl=: 160 lines with bidirectional queries and normalized
+relational storage. Architecturally broken — =send/1= is a hardcoded switch
+statement; =new=, =defclass=, =defmethod= bypass the method table entirely.
+Metacircularity is cosmetic: =isa(class, class)= is asserted but never
+participates in dispatch.
+
+** =attempt-3/= — Detailed 6-point spec (~10k+ tokens)
+
+Prompt: 6 specific requirements (bootstrapping methods, method objects,
+bidirectional query, inheritance resolution, relational storage). No mention
+of ObjVLisp by name.
+
+Produced =object_kernel.pl= + =test_kernel.pl=: ~330 lines with a full plunit
+test suite. Methods are first-class objects. Architecture is sound but has a
+fixable logic bug — =new= backtracks forever due to a wrong base case.
+
+** =attempt-4/= — Architecture-as-spec (~1.8k tokens)
+
+Prompt: gave the exact data representation (=class/2=, =has/3=, =oapply/2=)
+and the dispatch algorithm.
+
+Produced =oo.pl=: 40 lines, structurally identical to the hand-written
+version. =oo-original.pl= is the first cut (=new= only); =oo.pl= is the
+iterated version with =allocate= + =initialize= split.
+
+* Key Finding
+
+Prompting for features produces features via whatever mechanism is locally
+convenient. Prompting for architecture produces a correct mechanism from which
+features emerge. For systems where the architecture /is/ the point, specify
+the architecture.
+
+* Documents
+
+- [[file:analysis.org][analysis.org]] — Full comparison of all 7 implementations (4 LLM + 3 human)
+  with discussion of coding doctrines
+- [[file:claude-analysis.org][claude-analysis.org]] — Claude's independent analysis of the code and skill
+  files, written after reading everything
