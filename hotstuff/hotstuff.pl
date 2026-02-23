@@ -169,7 +169,8 @@ on_proposal(Block, JustifyQC, S0, S3) :-
     ->  block_round(Block, Round),
         S3 = S2.put(last_voted, Round)
     ;   S3 = S2
-    ).
+    ),
+    !.
 
 %% update_qc_high(+QC, +StateIn, -StateOut)
 %% Update qc_high if the new QC is for a higher round.

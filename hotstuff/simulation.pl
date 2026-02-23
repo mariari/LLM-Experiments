@@ -9,8 +9,8 @@
 %%   3. Votes are collected; if quorum is reached, a QC forms
 %%   4. Next round begins with the QC passed to the new leader
 %%
-%% This is the "happy path" — all replicas honest, no faults, no timeouts.
-%% It validates that the core protocol produces commits correctly.
+%% Supports both the happy path (all honest) and faulty leaders (skipped
+%% rounds where no proposal is made, triggering view change).
 
 :- use_module(hotstuff).
 :- use_module(library(lists)).
@@ -110,6 +110,48 @@ replica_on_proposal(Block, QC, _N, Id, Replicas0-Votes0, Replicas1-Votes1) :-
     ).
 
 %%%=========================================================================
+%%% Faulty round (view change)
+%%%=========================================================================
+
+%% skip_round(+NetIn, -NetOut)
+%%
+%% The leader for this round is faulty — no proposal is made.
+%% Replicas timeout and advance to the next round. Each replica sends
+%% its qc_high to the next leader. The next leader picks the highest
+%% QC among all received and uses it as the justify QC for the next
+%% proposal.
+%%
+%% In HotStuff, this is the "new-view" message flow. We model it as:
+%% the network advances round, last_qc becomes the highest qc_high
+%% across all replicas.
+
+skip_round(Net0, NetOut) :-
+    Round = Net0.round,
+    N = Net0.n,
+    leader(Round, N, LeaderId),
+    %% Collect all replicas' qc_high, pick the highest
+    assoc_to_keys(Net0.replicas, Ids),
+    maplist(replica_qc_high(Net0.replicas), Ids, QCs),
+    highest_qc(QCs, BestQC),
+    Event = event(Round, LeaderId, fault, [], BestQC),
+    NextRound is Round + 1,
+    NetOut = Net0.put(round, NextRound)
+                  .put(last_qc, BestQC)
+                  .put(log, [Event | Net0.log]),
+    !.
+
+replica_qc_high(Replicas, Id, QC) :-
+    get_assoc(Id, Replicas, S),
+    QC = S.qc_high.
+
+highest_qc([QC], QC).
+highest_qc([QC1, QC2 | Rest], Best) :-
+    qc_round(QC1, R1),
+    qc_round(QC2, R2),
+    (R1 >= R2 -> Higher = QC1 ; Higher = QC2),
+    highest_qc([Higher | Rest], Best).
+
+%%%=========================================================================
 %%% Run multiple rounds
 %%%=========================================================================
 
@@ -118,6 +160,16 @@ run_rounds([], Net, Net).
 run_rounds([Cmd | Cmds], Net0, NetOut) :-
     run_round(Cmd, Net0, Net1),
     run_rounds(Cmds, Net1, NetOut).
+
+%% run_scenario(+Actions, +NetIn, -NetOut)
+%% Actions are: cmd(X) for a normal round, or fault for a skipped round.
+run_scenario([], Net, Net) :- !.
+run_scenario([cmd(Cmd) | Rest], Net0, NetOut) :- !,
+    run_round(Cmd, Net0, Net1),
+    run_scenario(Rest, Net1, NetOut).
+run_scenario([fault | Rest], Net0, NetOut) :-
+    skip_round(Net0, Net1),
+    run_scenario(Rest, Net1, NetOut).
 
 %%%=========================================================================
 %%% Inspection helpers
@@ -203,6 +255,32 @@ test(agreement, [true]) :-
     run_rounds([tx_a, tx_b, tx_c, tx_d, tx_e, tx_f, tx_g], Net0, Net),
     all_committed(Net, [_-Expected | Rest]),
     Expected \= [],
+    maplist([_-Cmds]>>(Cmds = Expected), Rest).
+
+%% A fault breaks the consecutive-round chain, delaying commits.
+test(fault_delays_commit, [true]) :-
+    fresh_network(4, Net0),
+    %% Normal: cmd, cmd, cmd, cmd -> tx_a committed after round 4
+    %% With fault at round 2: rounds 1,3,4,5 aren't consecutive
+    run_scenario([cmd(tx_a), fault, cmd(tx_b), cmd(tx_c), cmd(tx_d)], Net0, Net),
+    committed_commands(Net, 1, Cmds),
+    \+ member(tx_a, Cmds).
+
+%% But recovery after fault still produces commits eventually.
+test(recovery_after_fault, [true]) :-
+    fresh_network(4, Net0),
+    %% Fault at round 2, then 5 good rounds: should eventually commit
+    run_scenario([cmd(tx_a), fault, cmd(tx_b), cmd(tx_c), cmd(tx_d),
+                  cmd(tx_e), cmd(tx_f), cmd(tx_g)], Net0, Net),
+    committed_commands(Net, 1, Cmds),
+    Cmds \= [].
+
+%% Agreement holds even with faults.
+test(agreement_with_faults, [true]) :-
+    fresh_network(4, Net0),
+    run_scenario([cmd(tx_a), fault, cmd(tx_b), cmd(tx_c), cmd(tx_d),
+                  cmd(tx_e), cmd(tx_f), cmd(tx_g)], Net0, Net),
+    all_committed(Net, [_-Expected | Rest]),
     maplist([_-Cmds]>>(Cmds = Expected), Rest).
 
 :- end_tests(simulation).
