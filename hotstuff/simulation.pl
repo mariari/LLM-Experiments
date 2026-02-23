@@ -194,10 +194,83 @@ print_log(Net) :-
     reverse(Net.log, Chronological),
     maplist(print_event, Chronological).
 
+print_event(event(Round, Leader, fault, _, _QC)) :- !,
+    format("Round ~w: leader=~w FAULT (no proposal)~n", [Round, Leader]).
 print_event(event(Round, Leader, block(_, _, Cmd), Votes, _QC)) :-
     length(Votes, NVotes),
     format("Round ~w: leader=~w cmd=~w votes=~w~n",
            [Round, Leader, Cmd, NVotes]).
+
+print_committed(Net) :-
+    all_committed(Net, Pairs),
+    maplist(print_replica_committed, Pairs).
+
+print_replica_committed(Id-Cmds) :-
+    reverse(Cmds, Chronological),
+    format("  Replica ~w committed: ~w~n", [Id, Chronological]).
+
+%%%=========================================================================
+%%% Partitioned replica simulation
+%%%=========================================================================
+
+%% run_round_partitioned(+Command, +Partitioned, +NetIn, -NetOut)
+%%
+%% Like run_round, but replicas in the Partitioned list don't receive
+%% the proposal (they don't vote). Models network partition or crash.
+
+run_round_partitioned(Command, Partitioned, Net0, NetOut) :-
+    Round = Net0.round,
+    N = Net0.n,
+    LastQC = Net0.last_qc,
+    qc_block(LastQC, ParentBlock),
+    Block = block(Round, ParentBlock, Command),
+    leader(Round, N, LeaderId),
+    assoc_to_keys(Net0.replicas, AllIds),
+    subtract(AllIds, Partitioned, ActiveIds),
+    foldl(replica_on_proposal(Block, LastQC, N), ActiveIds,
+          Net0.replicas-[], Replicas1-VotesRev),
+    reverse(VotesRev, Votes),
+    (   length(Votes, VoteCount),
+        Quorum is (2 * N + 1) // 3,
+        VoteCount >= Quorum
+    ->  NewQC = qc(Block, Votes)
+    ;   NewQC = LastQC
+    ),
+    Event = event(Round, LeaderId, Block, Votes, NewQC),
+    NextRound is Round + 1,
+    NetOut = Net0.put(replicas, Replicas1)
+                  .put(round, NextRound)
+                  .put(last_qc, NewQC)
+                  .put(log, [Event | Net0.log]),
+    !.
+
+%%%=========================================================================
+%%% Demo — run in swipl -g demo -t halt simulation.pl
+%%%=========================================================================
+
+demo :-
+    format("=== HotStuff Demo: 4 replicas, happy path ===~n~n"),
+    fresh_network(4, N0),
+    run_rounds([tx_a, tx_b, tx_c, tx_d, tx_e, tx_f], N0, N1),
+    print_log(N1),
+    nl, print_committed(N1),
+
+    format("~n=== With faulty leader at round 2 ===~n~n"),
+    fresh_network(4, N2),
+    run_scenario([cmd(tx_a), fault, cmd(tx_b), cmd(tx_c),
+                  cmd(tx_d), cmd(tx_e), cmd(tx_f), cmd(tx_g)], N2, N3),
+    print_log(N3),
+    nl, print_committed(N3),
+
+    format("~n=== With replica 4 partitioned (3 of 4 vote) ===~n~n"),
+    fresh_network(4, N4),
+    run_round_partitioned(tx_a, [4], N4, N5),
+    run_round_partitioned(tx_b, [4], N5, N6),
+    run_round_partitioned(tx_c, [4], N6, N7),
+    run_round_partitioned(tx_d, [4], N7, N8),
+    run_round_partitioned(tx_e, [4], N8, N9),
+    print_log(N9),
+    nl, print_committed(N9).
 
 %%%=========================================================================
 %%% Tests
@@ -282,6 +355,32 @@ test(agreement_with_faults, [true]) :-
                   cmd(tx_e), cmd(tx_f), cmd(tx_g)], Net0, Net),
     all_committed(Net, [_-Expected | Rest]),
     maplist([_-Cmds]>>(Cmds = Expected), Rest).
+
+%% Partitioned replica doesn't commit, but active ones agree.
+test(partition_one_replica, [true]) :-
+    fresh_network(4, Net0),
+    run_round_partitioned(tx_a, [4], Net0, N1),
+    run_round_partitioned(tx_b, [4], N1, N2),
+    run_round_partitioned(tx_c, [4], N2, N3),
+    run_round_partitioned(tx_d, [4], N3, N4),
+    run_round_partitioned(tx_e, [4], N4, Net),
+    %% Active replicas commit
+    committed_commands(Net, 1, C1),
+    committed_commands(Net, 2, C2),
+    committed_commands(Net, 3, C3),
+    C1 = C2, C2 = C3,
+    member(tx_a, C1),
+    %% Partitioned replica commits nothing
+    committed_commands(Net, 4, []).
+
+%% Too many partitioned: no quorum, no commits.
+test(no_quorum_no_commit, [true]) :-
+    fresh_network(4, Net0),
+    run_round_partitioned(tx_a, [3, 4], Net0, N1),
+    run_round_partitioned(tx_b, [3, 4], N1, N2),
+    run_round_partitioned(tx_c, [3, 4], N2, N3),
+    run_round_partitioned(tx_d, [3, 4], N3, Net),
+    committed_commands(Net, 1, []).
 
 %% Works with different network sizes (7 replicas, f=2).
 test(seven_replicas, [true]) :-
